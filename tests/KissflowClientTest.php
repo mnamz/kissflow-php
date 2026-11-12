@@ -26,10 +26,14 @@ final class KissflowClientTest extends TestCase
     /** @var int[] */
     private array $sleeps = [];
 
+    /** Fake clock (ms); advanced by the fake sleeper. */
+    private float $now = 0.0;
+
     private function client(array $responses, array $config = []): KissflowClient
     {
         $this->history = [];
         $this->sleeps = [];
+        $this->now = 0.0;
         $stack = HandlerStack::create(new MockHandler($responses));
         $stack->push(Middleware::history($this->history));
 
@@ -44,7 +48,9 @@ final class KissflowClientTest extends TestCase
             null,
             function (int $ms): void {
                 $this->sleeps[] = $ms;
+                $this->now += $ms;
             },
+            fn (): float => $this->now,
         );
     }
 
@@ -407,7 +413,7 @@ final class KissflowClientTest extends TestCase
 
     public function test_upload_image_is_retried_with_full_body(): void
     {
-        $kf = $this->client([new Response(503), self::json(['ok' => true])]);
+        $kf = $this->client([new Response(429), self::json(['ok' => true])]);
 
         $kf->dataset('U')->uploadImage('r1', 'image_1', 'bytes');
 
@@ -518,5 +524,107 @@ final class KissflowClientTest extends TestCase
             $this->assertSame(0, $e->getStatus());
             $this->assertInstanceOf(ConnectException::class, $e->getPrevious());
         }
+    }
+
+    public function test_post_is_not_retried_on_gateway_error(): void
+    {
+        $kf = $this->client([new Response(503), self::json(['ok' => true])]);
+
+        try {
+            $kf->dataset('X')->create(['Name' => 'k']);
+            $this->fail('expected ApiException');
+        } catch (ApiException $e) {
+            $this->assertSame(503, $e->getStatus());
+        }
+        $this->assertCount(1, $this->history);
+        $this->assertSame([], $this->sleeps);
+    }
+
+    public function test_post_is_not_retried_on_connect_error(): void
+    {
+        $req = new Request('POST', 'https://acme.kissflow.com');
+        $kf = $this->client([new ConnectException('timeout', $req), self::json(['ok' => true])]);
+
+        $this->expectException(ApiException::class);
+        try {
+            $kf->dataset('X')->create(['Name' => 'k']);
+        } finally {
+            $this->assertCount(1, $this->history);
+        }
+    }
+
+    public function test_put_is_retried_on_gateway_error(): void
+    {
+        $kf = $this->client([new Response(502), self::json(['ok' => true])], ['retry_delay_ms' => 1]);
+
+        $kf->dataset('X')->update('k', ['F' => 1]);
+
+        $this->assertCount(2, $this->history);
+    }
+
+    public function test_post_is_retried_on_429(): void
+    {
+        $kf = $this->client([new Response(429), self::json(['ok' => true])], ['retry_delay_ms' => 1]);
+
+        $kf->dataset('X')->create(['Name' => 'k']);
+
+        $this->assertCount(2, $this->history);
+    }
+
+    public function test_403_challenge_is_detected(): void
+    {
+        $kf = $this->client([new Response(403, ['CF-Mitigated' => 'challenge'], '<html>')]);
+
+        try {
+            $kf->users()->list();
+            $this->fail('expected ApiException');
+        } catch (ApiException $e) {
+            $this->assertTrue($e->isChallenged());
+            $this->assertSame('challenge', $e->getResponseHeader('cf-mitigated'));
+            $this->assertStringContainsString('security check', $e->getMessage());
+        }
+    }
+
+    public function test_plain_403_is_not_a_challenge(): void
+    {
+        $kf = $this->client([new Response(403, [], '{"error_code":"KISSFLOW_ERROR_00010"}')]);
+
+        try {
+            $kf->users()->list();
+            $this->fail('expected ApiException');
+        } catch (ApiException $e) {
+            $this->assertFalse($e->isChallenged());
+            $this->assertStringNotContainsString('security check', $e->getMessage());
+        }
+    }
+
+    public function test_rate_limit_waits_for_window_to_free_up(): void
+    {
+        $kf = $this->client([
+            self::json(['Data' => []]),
+            self::json(['Data' => []]),
+            self::json(['Data' => []]),
+        ], ['rate_limit_per_minute' => 2]);
+
+        $kf->users()->list();
+        $this->now += 10_000;
+        $kf->users()->list();
+        $this->assertSame([], $this->sleeps);
+
+        $kf->users()->list();
+        $this->assertSame([50_000], $this->sleeps); // first send at t=0 frees up at t=60s
+        $this->assertCount(3, $this->history);
+    }
+
+    public function test_rate_limit_off_by_default_and_rejects_negative(): void
+    {
+        $kf = $this->client(array_fill(0, 5, self::json(['Data' => []])));
+        for ($i = 0; $i < 5; $i++) {
+            $kf->users()->list();
+        }
+        $this->assertSame([], $this->sleeps);
+
+        $this->expectException(ConfigurationException::class);
+        Config::fromArray(['base_url' => 'https://a.kissflow.com', 'account_id' => 'A', 'access_key_id' => 'x', 'access_key_secret' => 'y', 'rate_limit_per_minute' => -1]);
     }
 }

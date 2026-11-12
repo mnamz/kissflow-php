@@ -27,6 +27,7 @@ final class Config
         public readonly int $retryDelayMs = 500,
         public readonly int $pageDelayMs = 100,
         public readonly bool $forceHttp11 = true,
+        public readonly int $rateLimitPerMinute = 0,
     ) {
         $this->baseUrl = rtrim($baseUrl, '/');
 
@@ -40,8 +41,8 @@ final class Config
             throw new ConfigurationException("Kissflow baseUrl must start with http(s)://, got '{$this->baseUrl}'.");
         }
 
-        if ($maxRetries < 0 || $retryDelayMs < 0 || $pageDelayMs < 0) {
-            throw new ConfigurationException('Kissflow retry/delay settings must be >= 0.');
+        if ($maxRetries < 0 || $retryDelayMs < 0 || $pageDelayMs < 0 || $rateLimitPerMinute < 0) {
+            throw new ConfigurationException('Kissflow retry/delay/rate-limit settings must be >= 0.');
         }
     }
 
@@ -49,7 +50,7 @@ final class Config
      * Build from an array, e.g. a Laravel config file or parsed env.
      *
      * Keys: base_url, account_id, access_key_id, access_key_secret, verify_ssl, timeout,
-     *       max_retries, retry_delay_ms, page_delay_ms, force_http11
+     *       max_retries, retry_delay_ms, page_delay_ms, force_http11, rate_limit_per_minute
      */
     public static function fromArray(array $c): self
     {
@@ -64,6 +65,7 @@ final class Config
             retryDelayMs: (int) ($c['retry_delay_ms'] ?? 500),
             pageDelayMs: (int) ($c['page_delay_ms'] ?? 100),
             forceHttp11: (bool) ($c['force_http11'] ?? true),
+            rateLimitPerMinute: (int) ($c['rate_limit_per_minute'] ?? 0),
         );
     }
 }

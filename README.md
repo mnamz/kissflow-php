@@ -84,7 +84,8 @@ $byField = $kf->users()->indexBy('Some_User_Field');    // index by any user col
 
 ### Errors
 
-- A non-2xx response throws `Aliifz\Kissflow\Exceptions\ApiException`. It has `getStatus()`, `getResponseBody()`, `getResponseJson()`, `isNotFound()` and `isUnauthorized()`.
+- A non-2xx response throws `Aliifz\Kissflow\Exceptions\ApiException`. It has `getStatus()`, `getResponseBody()`, `getResponseJson()`, `getResponseHeaders()`, `getResponseHeader($name)`, `isNotFound()`, `isUnauthorized()` and `isChallenged()`.
+- `isChallenged()` is true for a 403 carrying `cf-mitigated: challenge`. That means a security check in front of Kissflow blocked the request, not a missing permission. Retrying from the same host usually fails the same way.
 - A network failure throws `ApiException` with status `0`. The Guzzle exception is available as `getPrevious()`.
 - Bad configuration throws `ConfigurationException`.
 - `get()` returns `null` on a 404 instead of throwing.
@@ -92,7 +93,12 @@ $byField = $kf->users()->indexBy('Some_User_Field');    // index by any user col
 
 ### Retries and pacing
 
-HTTP 429, 502, 503, 504 and connection errors are retried up to `max_retries` times (default 2). The wait doubles each time, starting at `retry_delay_ms` (default 500). A `Retry-After` header overrides that wait.
+Failed requests are retried up to `max_retries` times (default 2). The wait doubles each time, starting at `retry_delay_ms` (default 500). A `Retry-After` header overrides that wait.
+
+- HTTP 429 is retried for every method, because the request was rejected rather than processed.
+- HTTP 502, 503, 504 and connection errors (including timeouts) are retried only for GET, HEAD, OPTIONS, PUT and DELETE. POST is not retried, since Kissflow may already have saved the record and a resend could create it twice. Handle the `ApiException` and check before resending.
+
+Kissflow allows 400 requests per minute per account, and UI traffic counts toward it. Set `rate_limit_per_minute` (default 0, off) to make the client wait instead of hitting the limit, for example `300` to leave room for users. The limit is tracked per client instance and counts retries.
 
 Paginated listings pause for `page_delay_ms` (default 100) between pages.
 
@@ -110,7 +116,8 @@ KISSFLOW_ACCOUNT_ID=AcXXXXXXXXXX
 KISSFLOW_ACCESS_KEY_ID=...
 KISSFLOW_ACCESS_KEY_SECRET=...
 # optional: KISSFLOW_VERIFY_SSL, KISSFLOW_TIMEOUT, KISSFLOW_MAX_RETRIES,
-#           KISSFLOW_RETRY_DELAY_MS, KISSFLOW_PAGE_DELAY_MS, KISSFLOW_FORCE_HTTP11, KISSFLOW_LOG_CHANNEL
+#           KISSFLOW_RETRY_DELAY_MS, KISSFLOW_PAGE_DELAY_MS, KISSFLOW_FORCE_HTTP11,
+#           KISSFLOW_RATE_LIMIT_PER_MINUTE, KISSFLOW_LOG_CHANNEL
 ```
 
 ```php
@@ -121,7 +128,7 @@ Kissflow::dataset('My_Dataset')->all();
 app(KissflowClient::class)->users()->all();   // or inject KissflowClient in a constructor
 ```
 
-## Kissflow gotchas (learned in production)
+## Kissflow limitations
 
 - Dataset dropdown columns silently drop values that are not current dropdown options. If it matters, read the row back after writing.
 - Dataset `DELETE` needs *delete* permission on that dataset for the API key. Without it you get HTTP 401 (`KISSFLOW_ERROR_00014`).

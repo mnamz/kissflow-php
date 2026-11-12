@@ -31,6 +31,13 @@ class KissflowClient
     /** Statuses worth retrying: rate limit and transient gateway errors. */
     private const RETRY_STATUSES = [429, 502, 503, 504];
 
+    /**
+     * Methods that are safe to resend after a gateway error or a dropped connection.
+     * POST is not: Kissflow may already have saved the record, so a resend could duplicate it.
+     * A 429 is retried for every method because the request was rejected, not processed.
+     */
+    private const IDEMPOTENT_METHODS = ['GET', 'HEAD', 'OPTIONS', 'PUT', 'DELETE'];
+
     private ClientInterface $http;
 
     private LoggerInterface $logger;
@@ -38,11 +45,18 @@ class KissflowClient
     /** @var Closure(int):void sleeps for the given milliseconds */
     private Closure $sleeper;
 
+    /** @var Closure():float current time in milliseconds */
+    private Closure $clock;
+
+    /** @var float[] send times (ms) inside the current rate-limit window */
+    private array $sentAt = [];
+
     public function __construct(
         private readonly Config $config,
         ?ClientInterface $http = null,
         ?LoggerInterface $logger = null,
         ?Closure $sleeper = null,
+        ?Closure $clock = null,
     ) {
         $this->http = $http ?? new GuzzleClient($this->guzzleOptions());
         $this->logger = $logger ?? new NullLogger();
@@ -51,6 +65,7 @@ class KissflowClient
                 usleep($ms * 1000);
             }
         };
+        $this->clock = $clock ?? static fn (): float => microtime(true) * 1000;
     }
 
     /**
@@ -117,13 +132,16 @@ class KissflowClient
             $options[RequestOptions::MULTIPART] = $multipart;
         }
 
+        $idempotent = in_array($method, self::IDEMPOTENT_METHODS, true);
         $attempt = 0;
         while (true) {
+            $this->throttle($method, $url);
             try {
                 $psr = $this->http->request($method, $url, $options);
                 $response = new Response($psr->getStatusCode(), (string) $psr->getBody(), $psr->getHeaders());
             } catch (ConnectException $e) {
-                if ($attempt < $this->config->maxRetries) {
+                // Guzzle also reports transfer timeouts as ConnectException, so a POST may have landed.
+                if ($idempotent && $attempt < $this->config->maxRetries) {
                     $this->backoff($attempt++, null, $method, $url, 'connect error: '.$e->getMessage());
 
                     continue;
@@ -131,7 +149,9 @@ class KissflowClient
                 throw new ApiException("Kissflow {$method} {$url} failed: ".$e->getMessage(), 0, '', $method, $url, $e);
             }
 
-            if (in_array($response->status, self::RETRY_STATUSES, true) && $attempt < $this->config->maxRetries) {
+            $retryable = $response->status === 429
+                || ($idempotent && in_array($response->status, self::RETRY_STATUSES, true));
+            if ($retryable && $attempt < $this->config->maxRetries) {
                 $retryAfter = $response->headers['Retry-After'][0] ?? $response->headers['retry-after'][0] ?? null;
                 $this->backoff($attempt++, $retryAfter, $method, $url, 'HTTP '.$response->status);
 
@@ -150,7 +170,7 @@ class KissflowClient
                 'status' => $response->status,
                 'response' => mb_substr($response->body, 0, 1000),
             ]);
-            throw ApiException::fromResponse($method, $url, $response->status, $response->body);
+            throw ApiException::fromResponse($method, $url, $response->status, $response->body, $response->headers);
         }
 
         return $response;
@@ -167,6 +187,36 @@ class KissflowClient
     public function logger(): LoggerInterface
     {
         return $this->logger;
+    }
+
+    /**
+     * Client-side rate limit: when rate_limit_per_minute is set, wait until the oldest send in
+     * the rolling 60-second window has aged out. Applies per client instance, retries included.
+     */
+    private function throttle(string $method, string $url): void
+    {
+        $limit = $this->config->rateLimitPerMinute;
+        if ($limit <= 0) {
+            return;
+        }
+
+        $now = ($this->clock)();
+        $this->sentAt = array_values(array_filter($this->sentAt, static fn (float $t): bool => $t > $now - 60_000));
+
+        if (count($this->sentAt) >= $limit) {
+            $waitMs = (int) ceil($this->sentAt[0] + 60_000 - $now);
+            $this->logger->info('Kissflow client rate limit reached, waiting', [
+                'method' => $method,
+                'url' => $url,
+                'limit_per_minute' => $limit,
+                'delay_ms' => $waitMs,
+            ]);
+            ($this->sleeper)($waitMs);
+            $now = ($this->clock)();
+            $this->sentAt = array_values(array_filter($this->sentAt, static fn (float $t): bool => $t > $now - 60_000));
+        }
+
+        $this->sentAt[] = $now;
     }
 
     private function backoff(int $attempt, ?string $retryAfter, string $method, string $url, string $reason): void

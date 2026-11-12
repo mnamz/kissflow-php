@@ -15,6 +15,10 @@ return [
     'page_delay_ms' => env('KISSFLOW_PAGE_DELAY_MS', 100),
     'force_http11' => env('KISSFLOW_FORCE_HTTP11', true),
 
+    // Client-side cap on requests per rolling minute (0 = off). Kissflow allows 400/min
+    // per account, UI traffic included, so leave headroom (e.g. 300).
+    'rate_limit_per_minute' => env('KISSFLOW_RATE_LIMIT_PER_MINUTE', 0),
+
     // Log channel for request/error logs; null = default channel.
     'log_channel' => env('KISSFLOW_LOG_CHANNEL'),
 ];
